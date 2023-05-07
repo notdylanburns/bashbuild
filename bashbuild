@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+
+usage() {
+    echo "usage: $0 <buildfile>"
+}
+
+exit_err() {
+    if [[ -z "$2" ]] ; then
+        2>&1 echo -e "\e[31;1merror:\e[37;1m $1\e[0m"
+    else
+        2>&1 echo -e "\e[33;1m[$2] \e[31;1merror:\e[37;1m $1\e[0m"
+    fi
+    exit 1
+}
+
+buildfile="$1"
+if [[ -z "$buildfile" ]] ; then
+    if [[ -f "bashbuild.yml" ]] ; then
+        buildfile="bashbuild.yml"
+    else
+        2>&1 usage
+        exit 1
+    fi
+fi
+
+basepath=$(dirname $(realpath $buildfile))
+echo "using build path: '$basepath'..."
+echo "using build file: '$buildfile'..." 
+
+content=$(cat $buildfile)
+if ! echo "$content" | yq . &>/dev/null ; then
+    exit_err echo "invalid build file: '$buildfile'"
+fi
+
+cd $basepath
+
+echo 'removing old build artifacts...'
+rm -rf build
+
+echo 'creating build directories...'
+if ! mkdir -p build ; then
+    exit_err "failed to create directory: '$basepath/build'"
+fi
+
+if ! mkdir -p build/bundle ; then
+    exit_err "failed to create directory: '$basepath/build/bundle'"
+fi
+
+build_dir="$basepath/build"
+bundle_dir="$build_dir/bundle"
+gzip_bundle="$build_dir/bundle.tgz"
+b64_bundle="$build_dir/bundle.b64"
+
+required_keys='["files", "entry", "target"]'
+missing_keys="$(echo -n "$content" | yq --argjson required "$required_keys" -r '. as $i | $required | map(if in($i) then empty else . end) | join(", ")')"
+if [[ -n "$missing_keys" ]] ; then
+    exit_err "missing keys: $missing_keys" "$buildfile"
+fi
+
+entry="$(echo -n "$content" | yq -r '.entry | if type != "string" then "" else . end')"
+if [[ -z "$entry" ]] ; then
+    exit_err "'entry' key must have a string value" "$buildfile"
+fi
+
+target="$(echo -n "$content" | yq -r '.target | if type != "string" then "" else . end')"
+if [[ -z "$target" ]] ; then
+    exit_err "'target' key must have a string value" "$buildfile"
+fi
+
+files="$(echo -n "$content" | yq -r '.files | if type != "object" then "" else . end')"
+if [[ -z "$files" ]] ; then
+    exit_err "'files' key must have an object value" "$buildfile"
+fi
+
+files="$(echo -n "$content" | yq -r '[.files | .. | type] | .[] | select(. != "string" and . != "object")')"
+if [[ -n "$files" ]] ; then
+    exit_err "'files' key must be a recursive mapping of string to string or string to object" "$buildfile"
+fi
+
+
+
+while read -r directory ; do
+    echo "creating bundle directory: '$directory'..."
+    if ! mkdir -p "$bundle_dir$directory" ; then
+        exit_err "failed to create directory: '$bundle_dir$directory'"
+    fi
+done < <(echo "$content" | yq -r \
+    'def get_paths($obj; $path):
+        $obj | to_entries | .[] |
+        if .value | type == "object" then
+            get_paths(.value; $path + "/" + .key)
+        else
+            $path
+        end;
+    [get_paths(.files; "")] | unique | .[] | select(. != "")'
+)
+
+while read -r file ; do
+    dst=$(echo "$file" | cut -d: -f1)
+    src=$(echo "$file" | cut -d: -f2)
+    if [[ -f "$src" ]] ; then
+        echo "copying source file '$src' to destination '$bundle_dir$dst'..."
+        if ! cp "$src" "$bundle_dir$dst" ; then
+            exit_err "failed to copy file '$src' to '$bundle_dir$dst'"
+        fi
+    elif [[ -d "$src" ]] ; then
+        echo "copying source directory '$src' to destination '$bundle_dir$dst'..."
+        if ! cp -r "$src" "$bundle_dir$dst" ; then
+            exit_err "failed to copy directory '$src' to '$bundle_dir$dst'"
+        fi
+    else
+        exit_err "no such file or directory '$src'"
+    fi
+done < <(echo "$content" | yq -r \
+    'def get_files($obj; $path):
+        $obj | to_entries | .[] |
+        if .value | type == "object" then
+            get_files(.value; $path + "/" + .key)
+        else
+            $path + "/" + .key + ":" + .value
+        end;
+    [get_files(.files; "")] | unique | .[]'
+)
+
+if ! ls "$bundle_dir/$entry" &>/dev/null ; then
+    exit_err "entry point '$entry' does not exist in bundle"
+fi
+
+echo "compressing bundle '$bundle_dir' into output '$gzip_bundle'..."
+pushd . >/dev/null
+cd "$bundle_dir"
+if ! tar -czf "$gzip_bundle" ./* ; then
+    exit_err "failed to create '$gzip_bundle'"
+fi
+popd >/dev/null
+
+echo "generating base64 encoded bundle..."
+if ! base64 "$gzip_bundle" >"$b64_bundle" ; then
+    exit_err "failed to create '$b64_bundle'"
+fi
+
+tmpfile_template="bashbuild-${target}-XXXXXXXXXXXX"
+
+echo "generating target file '$build_dir/$target'..."
+cat << EOF >"$build_dir/$target"
+#!/usr/bin/env bash
+
+_bashbuild='$(cat "$b64_bundle" | tr -d '\n')'
+
+trap "rm -rf '\$basedir'" EXIT
+
+if [[ -n "\$BASHBUILD_DIR" ]] ; then
+    basedir=\$(mktemp --tmpdir="\$BASHBUILD_DIR" --directory -t '$tmpfile_template')
+else
+    basedir=\$(mktemp --directory -t '$tmpfile_template')
+fi
+
+echo -n \$_bashbuild | base64 -d | tar -C "\$basedir" -xzf -
+trap - EXIT
+
+"\$basedir/$entry" \$*
+code=$?
+
+rm -rf "\$basedir"
+exit \$code
+EOF
+
+echo "making target file '$build_dir/$target' executable..."
+chmod +x "$build_dir/$target"

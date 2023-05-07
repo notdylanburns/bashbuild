@@ -1,0 +1,5 @@
+entry: main.sh
+target: test
+files:
+  lib.sh: lib.sh
+  main.sh: test.sh
