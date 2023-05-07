@@ -159,7 +159,7 @@ echo -n \$_bashbuild | base64 -d | tar -C "\$basedir" -xzf -
 trap - EXIT
 
 "\$basedir/$entry" \$*
-code=$?
+code=\$?
 
 rm -rf "\$basedir"
 exit \$code
